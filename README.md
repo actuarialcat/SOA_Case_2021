@@ -1,7 +1,7 @@
 # 2021 SOA Student Research Case Study Challenge
 
 This project develops and prices an innovative insurance product that protects against myopia (short-sightedness) risk.
-Our team from the University of Hong Kong is one of the finalist.
+Our team, from the University of Hong Kong, is one of the finalist.
 
 Highlight of the project:
 - Attempt to offer protection against a new risk -- Myopia (short-sightedness) risk
