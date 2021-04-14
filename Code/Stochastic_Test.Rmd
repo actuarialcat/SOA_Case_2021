@@ -1,0 +1,877 @@
+---
+title: "Stochastic_Test"
+author: "ActuarialCat"
+date: "February 20, 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library}
+library(data.table)
+library(ggplot2)
+
+library(parallel)
+```
+
+
+```{r load table}
+tables_file = "tables/"
+
+tbl_mortality = fread(paste0(tables_file, "mortality.csv"))
+tbl_myopia = fread(paste0(tables_file, "myopia.csv"))
+tbl_myopia_odds = fread(paste0(tables_file, "myopia_odds.csv"))
+
+tbl_economic = fread(paste0(tables_file, "economic.csv"))
+tbl_expense = fread(paste0(tables_file, "expense.csv"))
+
+tbl_PAD = fread(paste0(tables_file, "PAD.csv"))
+tbl_param = fread(paste0(tables_file, "param.csv"))
+
+tbl_business_mix = fread(paste0(tables_file, "business_mix.csv"))
+tbl_rates = fread(paste0(tables_file, "rates.csv"))
+
+tbl_SA = fread(paste0(tables_file, "SA.csv"))
+
+
+```
+
+
+``` {r parameters}
+
+param = data.table(
+    entry_age = 0.5,
+    SA = 1000000,
+    
+    sex = "M",
+    num_of_myopic_parents = 2,
+    num_of_educated_parents = 2,
+    country = "P",
+    
+    PAD_mort = 1,
+    PAD_myopia = 1,
+    PAD_lapse = 1,
+    PAD_exp = 1,
+    PAD_inflation = 0,
+    PAD_interest = 0
+)
+
+param_res = data.table(
+    entry_age = 0.5,
+    SA = 1000000,
+    
+    sex = "M",
+    num_of_myopic_parents = 2,
+    num_of_educated_parents = 2,
+    country = "P",
+    
+    PAD_mort = 1 + tbl_PAD[item == "mortaliy", PAD],
+    PAD_myopia = 1 + tbl_PAD[item == "myopia", PAD],
+    PAD_lapse = 1 + tbl_PAD[item == "lapse", PAD],
+    PAD_exp = 1 + tbl_PAD[item == "expense", PAD],
+    PAD_interest = tbl_PAD[item == "interest", PAD],
+    PAD_inflation = 0.01
+)
+
+
+
+
+```
+
+
+# -------------------------------------
+
+```{r table generators}
+
+generate_interest_rates = function(short_rate, long_rate, mix_year, PAD = 0){
+    # Generatre interest rate table
+    
+    t = 1:50
+    
+    spot = fifelse(t > mix_year, long_rate, 
+                   short_rate * (1 - (t-1)/mix_year) + long_rate * (t-1)/mix_year)
+    fwd = fifelse(t == 1, spot, 
+                  (1 + spot) ^ t / (1 + shift(spot, 1)) ^ (t - 1) - 1)
+    fwd_PAD = fwd * (1 + PAD)
+    
+    fwd_mth = (1 + fwd) ^ (1/12) - 1
+    fwd_PAD_mth = (1 + fwd_PAD) ^ (1/12) - 1 
+    
+    return(data.table(t, spot, fwd, fwd_PAD, fwd_mth, fwd_PAD_mth))
+}
+
+generate_decrement_table = function(n, mort, myopia, lapse){
+    # Generate a decrement table
+    
+    t = seq(0, n - 1/12, 1/12)
+    
+    dep_mort_pp = mort * (1 - myopia/2)
+    dep_myopia_pp = myopia * (1 - mort/2)
+    dep_lapse_pp = lapse * (1 - mort) * (1 - myopia)
+    
+    EOP_IF = rep(NA, n * 12)
+    EOP_IF[1] = 1
+    
+    for (i in 2:(n*12)) {
+        EOP_IF[i] = EOP_IF[i-1] - (dep_mort_pp[i] + dep_myopia_pp[i] + dep_lapse_pp[i]) * EOP_IF[i-1]
+    }
+    
+    BOP_IF = shift(EOP_IF, 1)
+    mort_IF = dep_mort_pp * BOP_IF
+    myopia_IF = dep_myopia_pp * BOP_IF
+    lapse_IF = dep_lapse_pp * BOP_IF
+    
+    return(data.table(t, BOP_IF, mort_IF, myopia_IF, lapse_IF, EOP_IF))
+}
+
+myopia_cum_to_rate = function(cum_odds){
+    # change cummulative rate to condition prob
+    
+    cum_prob = cum_odds/(1+cum_odds)
+    rate = (cum_prob - shift(cum_prob)) / (1 - shift(cum_prob))
+    rate[1] = 0
+    
+    return(rate)
+}
+
+```
+
+# -------------------------------------
+
+```{r functions}
+
+lookup_misc_rate = function(param){
+    
+    #unwarp
+    entry_age = param[1, entry_age]
+    SA = param[, SA]
+    
+    sex = param[, sex]
+    num_of_myopic_parents = param[, num_of_myopic_parents]
+    num_of_educated_parents = param[, num_of_educated_parents]
+    country = param[, country]
+    
+    PAD_exp = param[, PAD_exp]
+    PAD_inflation = param[, PAD_inflation]
+    PAD_interest = param[, PAD_interest]
+    
+    
+    #income
+    index_code = paste0(sex, num_of_myopic_parents, num_of_educated_parents, country)
+    premium = tbl_rates[Key == index_code, Rate] * SA / 1000
+    
+
+    #expense
+    comm_init = tbl_expense[item == "comm_init", fixed] +
+                    tbl_expense[item == "comm_init", per_SA] * SA / 1000 +
+                    tbl_expense[item == "comm_init", per_prem] * premium
+    comm_renew = tbl_expense[item == "comm_renew", fixed]  +
+                    tbl_expense[item == "comm_renew", per_SA] * SA / 1000 +
+                    tbl_expense[item == "comm_renew", per_prem] * premium / 20
+    main_exp = tbl_expense[item == "main_exp", fixed] +
+                    tbl_expense[item == "main_exp", per_SA] * SA / 1000 +
+                    tbl_expense[item == "main_exp", per_prem] * premium / 20
+    claim_exp = tbl_expense[item == "claim_exp", fixed] +
+                    tbl_expense[item == "claim_exp", per_SA] * SA / 1000 +
+                    tbl_expense[item == "claim_exp", per_prem] * premium / 20
+    
+    inflation = 1 + tbl_param[item == "inflation", baseline] + PAD_inflation
+    
+    
+    #interest
+    short_rate = tbl_economic[item == paste0(country, "_short"), mean]
+    long_rate = tbl_economic[item == paste0(country, "_long"), mean]
+    
+    
+    #ouput
+    return(list(premium, comm_init, comm_renew, main_exp, claim_exp, inflation, short_rate, long_rate))
+}
+
+
+
+lookup_decrement_rate = function(param){
+    
+    #unwarp
+    entry_age = param[1, entry_age]
+    
+    sex = param[, sex]
+    num_of_myopic_parents = param[, num_of_myopic_parents]
+    num_of_educated_parents = param[, num_of_educated_parents]
+    country = param[, country]
+    
+    PAD_mort = param[, PAD_mort]
+    PAD_myopia = param[, PAD_myopia]
+    PAD_lapse = param[, PAD_lapse]
+    
+    #time
+    n = 21 - entry_age
+    t = seq(0, n - 1/12, 1/12)
+    
+    age = entry_age + t
+    age_round = floor(age)
+    
+    #Myopia Factors
+    country_factor = ifelse(country == "P" , 0.813167554186143, 0.837886885292246)
+    
+    underwrite_factor = ifelse(sex == "M", 1, tbl_myopia_odds[item == "sex_F", baseline] ) *
+        ifelse(num_of_myopic_parents == 0, 1, 
+            ifelse(num_of_myopic_parents == 1, tbl_myopia_odds[item == "myopic_1", baseline],
+                   tbl_myopia_odds[item == "myopic_2", baseline])) *
+        ifelse(num_of_educated_parents == 0, 1, 
+            ifelse(num_of_myopic_parents == 1, tbl_myopia_odds[item == "educate_1", baseline],
+                   tbl_myopia_odds[item == "educate_2", baseline]))
+    
+    #Decrement
+    mort_raw = merge(data.table(age_round), tbl_mortality, by.x = "age_round", by.y = "age")
+    mort_index = paste0(country, sex)
+    mort_PP = mort_raw[, get(mort_index)] / 1000 / 12 * PAD_mort
+    
+    tbl_myopia[, cum_odds_adj := cum_odds * country_factor * underwrite_factor]
+    tbl_myopia[, rates_adj := myopia_cum_to_rate(cum_odds_adj)]
+    myopia_raw = merge(data.table(age_round), tbl_myopia, by.x = "age_round", by.y = "age")
+    myopia_PP = myopia_raw[, rates_adj] / 12 * PAD_myopia
+    
+    lapse_PP = rep(0, n*12) * PAD_lapse
+    
+    #output
+    return(list(mort_PP, myopia_PP, lapse_PP))
+}
+
+```
+
+
+
+
+# -------------------------------------
+
+```{r deterministic}
+
+deterministic_model = function(param){
+    
+    #unwarp
+    entry_age = param[1, entry_age]
+    SA = param[, SA]
+    
+    sex = param[, sex]
+    num_of_myopic_parents = param[, num_of_myopic_parents]
+    num_of_educated_parents = param[, num_of_educated_parents]
+    country = param[, country]
+    
+    PAD_mort = param[, PAD_mort]
+    PAD_myopia = param[, PAD_myopia]
+    PAD_lapse = param[, PAD_lapse]
+    PAD_exp = param[, PAD_exp]
+    PAD_inflation = param[, PAD_inflation]
+    PAD_interest = param[, PAD_interest]
+    
+    #time
+    n = 21 - entry_age
+    t = seq(0, n - 1/12, 1/12)
+    
+    
+    #Param
+    exp_list = lookup_misc_rate(param)
+    premium = exp_list[[1]]
+    comm_init = exp_list[[2]]
+    comm_renew = exp_list[[3]]
+    main_exp = exp_list[[4]]
+    claim_exp = exp_list[[5]]
+    inflation = exp_list[[6]]
+    short_rate = exp_list[[7]]
+    long_rate = exp_list[[8]]
+    
+    
+    interest_raw = generate_interest_rates(short_rate, long_rate, 10, PAD_interest)
+    interest = merge(data.table(t, year = ceiling(t)), interest_raw, by.x = "year", by.y = "t", all.x = TRUE)
+    
+
+    #Decrement
+    PP_list = lookup_decrement_rate(param)
+    
+    mort_PP = PP_list[[1]]
+    myopia_PP = PP_list[[2]]
+    lapse_PP = PP_list[[3]]
+    
+    decrement = generate_decrement_table(n, mort_PP, myopia_PP, lapse_PP)
+    
+    
+    #Cash Flow
+    premium_IF = c(0, premium, rep(0, n*12-2)) * decrement[,BOP_IF]
+    
+    death_outgo = -premium * decrement[,mort_IF]
+    myopia_outgo = -SA * decrement[,myopia_IF]
+    benefit_IF = death_outgo + myopia_outgo
+    
+    commission_IF = -rep(comm_renew /12, n*12) * decrement[,BOP_IF]
+    commission_IF[1] = -comm_init
+    claims_exp_IF = -claim_exp * (inflation ^ (t - 1/12)) * (decrement[,mort_IF] + decrement[,myopia_IF]) * PAD_exp
+    main_exp_IF = -main_exp /12 * (inflation ^ (t - 1/12)) * decrement[,BOP_IF] * PAD_exp
+    
+    pre_contract_CF = c(commission_IF[1], rep(0, n*12-1))
+    BOP_CF = premium_IF + commission_IF + main_exp_IF
+    EOP_CF = benefit_IF + claims_exp_IF
+    
+    CF = data.table(t, premium_IF, 
+                    death_outgo, myopia_outgo, benefit_IF,
+                    commission_IF, claims_exp_IF, main_exp_IF,
+                    pre_contract_CF, BOP_CF, EOP_CF)
+    
+    # Reserve
+    EOP_reserve_IF = c(rep(NA, n*12-1), 0)
+        
+    for (i in (n*12):2){
+        EOP_reserve_IF[i-1] = max(0,
+            (EOP_reserve_IF[i] - EOP_CF[i]) / (1 + interest[i, fwd_PAD_mth]) - BOP_CF[i])
+    }
+    
+    EOP_reserve_PP = EOP_reserve_IF / decrement[, EOP_IF]
+
+
+    return( list(decrement, CF, interest, EOP_reserve_PP))
+}
+
+
+
+generate_reserve_table = function(){
+    
+    reserve = list()
+    
+    # loop through all combinations
+    for (sex in c("M", "F")){
+    for (num_of_myopic_parents in c(0, 1, 2)){
+    for (num_of_educated_parents in c(0, 1, 2)){
+    for (country in c("A", "P")){
+        
+        # param
+        index_code = paste0(sex, num_of_myopic_parents, num_of_educated_parents, country)
+        
+        param_inp = data.table(
+            entry_age = 0.5,
+            SA = 1000,
+            
+            sex = sex,
+            num_of_myopic_parents = num_of_myopic_parents,
+            num_of_educated_parents = num_of_educated_parents,
+            country = country,
+            
+            PAD_mort = 1 + tbl_PAD[item == "mortaliy", PAD],
+            PAD_myopia = 1 + tbl_PAD[item == "myopia", PAD],
+            PAD_lapse = 1 + tbl_PAD[item == "lapse", PAD],
+            PAD_exp = 1 + tbl_PAD[item == "expense", PAD],
+            PAD_interest = tbl_PAD[item == "interest", PAD],
+            PAD_inflation = 0.01
+        )
+        
+        ouput = deterministic_model(param_inp)
+        
+        reserve[index_code] = list(ouput[[4]])
+        
+    
+    # end big loop    
+    }
+    }
+    }
+    }
+    
+    return (reserve)
+}
+
+``` 
+
+
+```{r run deterministic}
+
+tbl_EOP_reserve_pp = generate_reserve_table()
+
+
+```
+
+# -------------------------------------
+
+```{r stochasitc ready data}
+
+generate_statis_sim_data = function(){
+    all_exp_list = list()
+    all_decrement_tbl = list()
+    all_SA_list = list()
+    
+    for (index_code in tbl_business_mix[, Key]){
+    
+        # SA
+        SA = tbl_SA[country == substr(index_code, 4, 4), SA]
+        all_SA_list[[index_code]] = SA
+        
+        # Expense List
+        param = data.table(
+            entry_age = 0.5,
+            SA = SA,
+            
+            sex = substr(index_code, 1, 1),
+            num_of_myopic_parents = as.numeric(substr(index_code, 2, 2)),
+            num_of_educated_parents = as.numeric(substr(index_code, 3, 3)),
+            country = substr(index_code, 4, 4),
+            
+            PAD_mort = 1,
+            PAD_myopia = 1,
+            PAD_lapse = 1,
+            PAD_exp = 1,
+            PAD_inflation = 0,
+            PAD_interest = 0
+        )
+    
+        all_exp_list[[index_code]] = lookup_misc_rate(param)
+        
+        #Decrement
+        PP_list = lookup_decrement_rate(param)
+        mort_PP = PP_list[[1]]
+        myopia_PP = PP_list[[2]]
+        lapse_PP = PP_list[[3]]
+        
+        dep_mort_pp = mort_PP * (1 - myopia_PP/2)
+        dep_myopia_pp = myopia_PP * (1 - mort_PP/2)
+            
+        EOP_reserve = tbl_EOP_reserve_pp[[index_code]] * param[, SA] / 1000
+    
+        all_decrement_tbl[[index_code]] = list(dep_mort_pp, dep_myopia_pp, EOP_reserve)
+    }
+        
+    return(list(all_exp_list, all_decrement_tbl, all_SA_list))
+}
+
+generate_statis_interest = function(){
+    #time
+    entry_age = 0.5
+    n = 21 - entry_age
+    t = seq(0, n - 1/12, 1/12)
+    
+    P_short = tbl_economic[item == paste0("P", "_short"), mean]
+    P_long = tbl_economic[item == paste0("P", "_long"), mean]
+    A_short = tbl_economic[item == paste0("A", "_short"), mean]
+    A_long = tbl_economic[item == paste0("A", "_long"), mean]
+    
+    P_interest_raw = generate_interest_rates(P_short, P_long, 10, 0)
+    A_interest_raw = generate_interest_rates(A_short, A_long, 10, 0)
+    
+    P_interest_mth = merge(data.table(t, year = ceiling(t)), P_interest_raw, by.x = "year", by.y = "t", all.x = TRUE)[, fwd_mth]
+    P_interest_mth[1] = 0
+    A_interest_mth = merge(data.table(t, year = ceiling(t)), A_interest_raw, by.x = "year", by.y = "t", all.x = TRUE)[, fwd_mth]
+    A_interest_mth[1] = 0
+    
+    #output
+    return(list(P = P_interest_mth, A = A_interest_mth))
+}
+
+temp_out = generate_statis_sim_data()
+all_exp_list = temp_out[[1]]
+all_decrement_tbl = temp_out[[2]]
+all_SA_list = temp_out[[3]]
+
+all_interest_tbl = generate_statis_interest()
+
+# hurdle discount
+entry_age = 0.5
+n = 21 - entry_age
+t = seq(0, n - 1/12, 1/12)
+
+hurdle_rate = 0.1
+hurdle_vt = (1 + hurdle_rate) ^ -t
+
+```
+
+
+```{r stochastic}
+
+simulate_business_mix = function(n){
+    rnd = runif(n)
+    
+    setkey(tbl_business_mix, start, end)
+    DT1 = data.table(start = rnd, end = rnd)
+    
+    return (tbl_business_mix$Key[foverlaps(DT1, tbl_business_mix, which = TRUE)$yid])
+}
+
+
+simulate_cert = function(exp_list, decrement_tbl, interest_mth, SA){
+    
+    #load
+    premium = exp_list[[1]]
+    comm_init = exp_list[[2]]
+    comm_renew = exp_list[[3]]
+    main_exp = exp_list[[4]]
+    claim_exp = exp_list[[5]]
+    inflation = exp_list[[6]]
+    short_rate = exp_list[[7]]
+    long_rate = exp_list[[8]]
+    
+    dep_mort_pp = decrement_tbl[[1]]
+    dep_myopia_pp = decrement_tbl[[2]]
+    EOP_reserve = decrement_tbl[[3]]
+    
+    #Simulate
+    BOP_CF = rep(0, n*12)
+    EOP_CF = rep(0, n*12)
+    
+    rnd_dec = c(1, runif(n*12 - 1))
+    
+    death_ind = fifelse(rnd_dec < dep_mort_pp, 1, 0)
+    myopia_ind = fifelse(rnd_dec >= dep_mort_pp & rnd_dec < dep_mort_pp + dep_myopia_pp, 1, 0)
+    
+    decrement_time_arr = which((death_ind + myopia_ind) > 0)
+    if (length(decrement_time_arr) > 0){
+        BOP_IF_ind = c(rep(1, decrement_time_arr[1]), rep(0, n*12 - decrement_time_arr[1]))
+        EOP_IF_ind = shift(BOP_IF_ind, -1, 0)
+    } else {
+        BOP_IF_ind = rep(1, n*12)
+        EOP_IF_ind = rep(1, n*12)
+    }
+    
+    BOP_reserve_change_IF = shift(EOP_reserve) * BOP_IF_ind 
+    EOP_reserve_change_IF = -EOP_reserve * EOP_IF_ind
+    
+    
+    #Cash Flow
+    premium_IF = c(0, premium, rep(0, n*12-2)) * BOP_IF_ind
+    
+    death_outgo = -premium * death_ind * BOP_IF_ind
+    myopia_outgo = -SA * myopia_ind * (1 - death_ind) * BOP_IF_ind
+    benefit_IF = death_outgo + myopia_outgo
+    
+    commission_IF = c(-comm_init, rep(0, n*12-1))
+    claims_exp_IF = -claim_exp * (inflation ^ (t - 1/12)) * (1 - EOP_IF_ind) * BOP_IF_ind
+    main_exp_IF = -main_exp / 12 * (inflation ^ (t - 1/12)) * BOP_IF_ind
+    
+    pre_contract_CF = c(commission_IF[1] - EOP_reserve[1], rep(0, n*12-1))
+    BOP_CF = premium_IF + commission_IF + main_exp_IF + BOP_reserve_change_IF
+    BOP_CF[1] = 0
+    EOP_CF = benefit_IF + claims_exp_IF + EOP_reserve_change_IF
+    EOP_CF[1] = 0
+    
+    CF = pre_contract_CF + EOP_CF + BOP_CF * (1 + interest_mth)
+    CF = CF * (1 - 0.256)
+    NPV = sum(CF * hurdle_vt)
+
+    #output
+    D_rate = ifelse(any(death_outgo != 0), 1, 0)
+    M_rate = ifelse(any(myopia_outgo != 0), 1, 0)
+    return(list(premium, NPV, D_rate, M_rate, CF))
+    
+}
+
+
+```
+
+
+
+
+```{r stochastic}
+
+simulate_economy = function(n){
+    
+    #time
+    n = 21 - entry_age
+    t = seq(0, n - 1/12, 1/12)
+    
+    #economy
+    P_short = 0.1
+    P_long = 0.1
+    A_short = 0.1
+    A_long = 0.1
+}
+
+```
+
+
+
+
+```{r single sim}
+
+#param
+N_cert = 10000
+
+#time
+entry_age = 0.5
+n = 21 - entry_age
+
+sim_total_prem = rep(NA, N_cert)
+sim_total_NPV = rep(NA, N_cert)
+D_rate = rep(NA, N_cert)
+M_rate = rep(NA, N_cert)
+CF = rep(NA, N_cert)
+
+sim_business = simulate_business_mix(N_cert)
+#sim_business = rep("M10P", N_cert)
+
+for(i in 1:N_cert){
+    index_code = sim_business[i]
+    country = substr(index_code, 4, 4)
+    
+    temp = simulate_cert(
+        all_exp_list[[index_code]], 
+        all_decrement_tbl[[index_code]], 
+        all_interest_tbl[[country]],
+        all_SA_list[[index_code]])
+    
+    sim_total_prem[i] = temp[[1]]
+    sim_total_NPV[i] = temp[[2]]
+
+}
+
+mean(sim_total_prem)
+mean(sim_total_NPV)
+
+
+
+```
+
+
+```{r batch sim}
+
+for (k in 1:15){
+#param
+N_sim = 5
+N_cert = 231823 
+
+#time
+entry_age = 0.5
+n = 21 - entry_age
+
+
+sim_total_prem = rep(NA, N_sim)
+sim_total_NPV = rep(NA, N_sim)
+
+for (j in 1:N_sim){
+    sim_business = simulate_business_mix(N_cert)
+
+    total_prem = 0
+    total_NPV = 0
+
+    for(i in 1:N_cert){
+        index_code = sim_business[i] 
+        country = substr(index_code, 4, 4)
+
+        temp = simulate_cert(
+            all_exp_list[[index_code]],
+            all_decrement_tbl[[index_code]],
+            all_interest_tbl[[country]],
+            all_SA_list[[index_code]])
+
+        total_prem = total_prem + temp[[1]]
+        total_NPV = total_NPV + temp[[2]]
+    }
+
+    # summerize batch
+    sim_total_prem[j] = total_prem
+    sim_total_NPV[j] = total_NPV
+
+
+}
+
+
+load("sim_result.Rdata")
+save_1 = c(save_1, sim_total_prem) 
+save_2 = c(save_2, sim_total_NPV)
+save(save_1, save_2,  file = "sim_result.Rdata")
+
+print(k)
+}
+
+
+```
+
+```{r parallel run}
+
+# init cluster
+cl <- makeCluster(detectCores())
+clusterEvalQ(cl, {require(data.table, quietly = TRUE)})
+clusterExport(cl, ls())
+
+test_func = function(x){
+    #param
+    N_cert = 231823 
+    
+    #time
+    entry_age = 0.5
+    n = 21 - entry_age
+    
+    sim_business = simulate_business_mix(N_cert)
+    
+    total_prem = 0
+    total_NPV = 0
+
+    for(i in 1:N_cert){
+        index_code = sim_business[i] 
+        country = substr(index_code, 4, 4)
+
+        temp = simulate_cert(
+            all_exp_list[[index_code]],
+            all_decrement_tbl[[index_code]],
+            all_interest_tbl[[country]],
+            all_SA_list[[index_code]])
+
+        total_prem = total_prem + temp[[1]]
+        total_NPV = total_NPV + temp[[2]]
+    }
+    
+    return(list(total_prem = total_prem, total_NPV = total_NPV))
+}
+
+for (k in 1:17){
+    out_list = parSapply(cl, 1:6, test_func)
+
+    sim_total_prem = unlist(out_list[1,])
+    sim_total_NPV = unlist(out_list[2,])
+    
+    load("sim_result_3.Rdata")
+    save_1 = c(save_1, sim_total_prem)
+    save_2 = c(save_2, sim_total_NPV)
+    save(save_1, save_2,  file = "sim_result_3.Rdata")
+    
+    print(k)
+}
+
+stopCluster(cl)
+
+
+```
+
+```{r stochatic result}
+
+load("sim_result_3.Rdata")
+sim_total_prem = save_1
+sim_total_NPV = save_2
+
+stoc_summary = function(x){
+    mean = mean(x)  
+    sd = sd(x)
+    median = median(x)
+    VaR_95 = quantile(x, 0.05)
+    VaR_995 = quantile(x, 0.005)
+
+    return(data.table(mean, sd, median, VaR_95, VaR_995))    
+}
+
+a = stoc_summary(sim_total_prem)
+b = stoc_summary(sim_total_NPV)
+
+print(a)
+print(b)
+
+ggplot(data.table(prem = sim_total_prem), aes(x = prem)) + geom_histogram()
+ggplot(data.table(NPV = sim_total_NPV), aes(x = NPV)) + geom_histogram()
+
+
+
+```
+
+
+# -------------------------------------
+
+```{r stochastic old}
+
+simulate_cert = function(param, interest_mth){
+    
+    #unwarp
+    entry_age = param[, entry_age]
+    SA = param[, SA]
+    
+    sex = param[, sex]
+    num_of_myopic_parents = param[, num_of_myopic_parents]
+    num_of_educated_parents = param[, num_of_educated_parents]
+    country = param[, country]
+    
+    PAD_mort = param[, PAD_mort]
+    PAD_myopia = param[, PAD_myopia]
+    PAD_lapse = param[, PAD_lapse]
+    PAD_exp = param[, PAD_exp]
+    PAD_inflation = param[, PAD_inflation]
+    PAD_interest = param[, PAD_interest]
+    
+    #time
+    n = 21 - entry_age
+    t = seq(0, n - 1/12, 1/12)
+    
+    index_code = paste0(sex, num_of_myopic_parents, num_of_educated_parents, country)
+    
+    #Param
+    exp_list = lookup_misc_rate(param)
+    premium = exp_list[[1]]
+    comm_init = exp_list[[2]]
+    comm_renew = exp_list[[3]]
+    main_exp = exp_list[[4]]
+    claim_exp = exp_list[[5]]
+    inflation = exp_list[[6]]
+    short_rate = exp_list[[7]]
+    long_rate = exp_list[[8]]
+    
+    EOP_reserve = tbl_EOP_reserve_pp[[index_code]] * SA * 0.001
+    
+    
+    #Decrement
+    PP_list = lookup_decrement_rate(param)
+    
+    mort_PP = PP_list[[1]]
+    myopia_PP = PP_list[[2]]
+    lapse_PP = PP_list[[3]]
+    
+    dep_mort_pp = mort_PP * (1 - myopia_PP/2)
+    dep_myopia_pp = myopia_PP * (1 - mort_PP/2)
+    
+    
+    #Simulate
+    BOP_CF = rep(0, n*12)
+    EOP_CF = rep(0, n*12)
+    
+    rnd_death = runif(n*12)
+    rnd_myopia = runif(n*12) 
+    
+    death_ind = fifelse(rnd_death < dep_mort_pp, 1, 0)
+    myopia_ind = fifelse(rnd_myopia < dep_myopia_pp, 1, 0)
+    
+    decrement_time_arr = which(death_ind + myopia_ind > 0)
+    decrement_time = ifelse(length(decrement_time_arr) > 1, decrement_time_arr[1], n*12)
+    BOP_IF_ind = c(rep(1, decrement_time), rep(0, n*12 - decrement_time))
+    EOP_IF_ind = shift(BOP_IF_ind, -1, 0)
+    
+    BOP_reserve_change_IF = shift(EOP_reserve) * BOP_IF_ind 
+    EOP_reserve_change_IF = -EOP_reserve * EOP_IF_ind
+    
+    
+    #Cash Flow
+    premium_IF = c(0, premium, rep(0, n*12-2)) * BOP_IF_ind
+    
+    death_outgo = -premium * death_ind * BOP_IF_ind
+    myopia_outgo = -SA * myopia_ind * BOP_IF_ind
+    benefit_IF = death_outgo + myopia_outgo
+    
+    commission_IF = c(-comm_init, rep(0, n*12-1))
+    claims_exp_IF = -claim_exp * (inflation ^ (t - 1/12)) * (1 - EOP_IF_ind) * BOP_IF_ind
+    main_exp_IF = -main_exp / 12 * (inflation ^ (t - 1/12)) * BOP_IF_ind
+    
+    pre_contract_CF = c(commission_IF[1] - EOP_reserve[1], rep(0, n*12-1))
+    BOP_CF = premium_IF + commission_IF + main_exp_IF + BOP_reserve_change_IF
+    BOP_CF[1] = 0
+    EOP_CF = benefit_IF + claims_exp_IF + EOP_reserve_change_IF
+    
+    CF = pre_contract_CF + EOP_CF + BOP_CF * (1 + interest_mth)
+
+    #output
+    return(list(premium, CF))
+    
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
