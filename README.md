@@ -5,7 +5,6 @@ Our team, from the University of Hong Kong, is one of the finalist.
 
 Highlight of the project:
 - Attempt to offer protection against a new risk -- Myopia (short-sightedness) risk
-- 
 - Sensitivity test and profitability anaylsis
 
 
