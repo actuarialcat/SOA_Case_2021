@@ -5,6 +5,8 @@ Our team, from the University of Hong Kong, is one of the finalist (Top 6 teams 
 
 Highlight of the project:
 - Attempt to offer protection against a new risk -- Myopia (short-sightedness) risk
+- Assumptions based on research in US, Hong Kong and other countries, adjusted for demographic characteristics
+- Actuarial cash flow / pricing model with stochasitic test
 - Sensitivity test and profitability anaylsis
 
 
