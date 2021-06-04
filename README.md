@@ -12,8 +12,8 @@ Highlight of the project:
 
 ## Documents links
 
-- [Presentation Slide](https://actuarialcat.github.io/SOA_Case_2021/HKU%20Actuarial%20Solutions_PPT.pdf)
 - [Pricing Report](https://actuarialcat.github.io/SOA_Case_2021/HKU%20Actuarial%20Solutions_NEW%20WORLD%20Parametric%20Insurance%20Report.pdf)
+- [Presentation Slide](https://actuarialcat.github.io/SOA_Case_2021/HKU%20Actuarial%20Solutions_PPT.pdf)
 - [Pricing Spreadsheet](https://actuarialcat.github.io/SOA_Case_2021/HKU%20Actuarial%20Solution%20Pricing%20Spreadsheet.xlsm)
 
 
