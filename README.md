@@ -9,6 +9,7 @@ Highlight of the project:
 - Actuarial cash flow / pricing model with stochasitic test
 - Sensitivity test and profitability anaylsis
 
+[Link to short article](https://actuarialcat.github.io/short-sightedness-insurance/)
 
 ## Documents links
 
